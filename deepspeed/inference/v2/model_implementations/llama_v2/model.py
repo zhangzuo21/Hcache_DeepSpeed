@@ -6,6 +6,7 @@
 from typing import Iterable, Optional, Tuple
 
 import torch
+from torch.cuda import Stream, Event
 
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
@@ -219,10 +220,33 @@ class Llama2InferenceModel(DSTransformerModelBase):
         return self._forward_unembed(residual, wrapped_batch), latent_cpu
 
     def restore_kv(self, wrapped_batch: RaggedBatchWrapper, latents: torch.Tensor):
-        # print(f"restore latents:{latents[0]}")
+        io_stream = Stream()
+        compute_stream = torch.cuda.default_stream()
+        io_done_events = [Event() for _ in range(len(latents))]
+        temp_store_done_events = [Event() for _ in range(len(latents))]
+        layer_buffer = torch.empty_like(latents[0], device=get_accelerator().current_device(), dtype=latents.dtype)
         for layer_idx, latent in enumerate(latents):
-            latent = latent.to(get_accelerator().current_device())
-            cur_params = self._transformer[layer_idx]
-            qkv = self.qkv(latent, cur_params.qkv_w, b=None)
-            kv_cache = self.state_manager.get_cache(layer_idx)
-            self.attn.restore_kv(qkv, kv_cache, wrapped_batch)
+            with torch.cuda.stream(io_stream):
+                if layer_idx > 0:
+                    io_stream.wait_event(temp_store_done_events[layer_idx - 1])
+                latent = latent.to(get_accelerator().current_device())
+                io_done_events[layer_idx].record(io_stream)
+            with torch.cuda.stream(compute_stream):
+                compute_stream.wait_event(io_done_events[layer_idx])
+                layer_buffer.copy_(latent)
+                temp_store_done_events[layer_idx].record(compute_stream)
+                cur_params = self._transformer[layer_idx]
+                qkv = self.qkv(layer_buffer, cur_params.qkv_w, b=None)
+                kv_cache = self.state_manager.get_cache(layer_idx)
+                self.attn.restore_kv(qkv, kv_cache, wrapped_batch)
+
+        io_stream.synchronize()
+        compute_stream.synchronize()
+
+    # def restore_kv(self, wrapped_batch: RaggedBatchWrapper, latents: torch.Tensor):
+    #     for layer_idx, latent in enumerate(latents):
+    #         latent = latent.to(get_accelerator().current_device())
+    #         cur_params = self._transformer[layer_idx]
+    #         qkv = self.qkv(latent, cur_params.qkv_w, b=None)
+    #         kv_cache = self.state_manager.get_cache(layer_idx)
+    #         self.attn.restore_kv(qkv, kv_cache, wrapped_batch)
