@@ -87,6 +87,13 @@ class DSSelfAttentionBase(DSModuleBase):
             attention_bias (Optional[torch.Tensor]): Attention bias tensor. If None, bias is disabled.
         """
         raise NotImplementedError()
+    
+    def restore_kv(self,
+                q_k_v: torch.Tensor,
+                kv_cache: torch.Tensor,
+                batch: RaggedBatchWrapper,
+                inv_freqs: Optional[torch.Tensor] = None):
+        raise NotImplementedError()
 
 
 class DSSelfAttentionRegistry(DSModuleRegistryBase):

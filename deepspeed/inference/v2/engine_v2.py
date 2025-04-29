@@ -104,10 +104,34 @@ class InferenceEngineV2:
         ranks = list(range(self._config.tensor_parallel.tp_size))
         return dist.new_group(ranks=ranks)
 
+    # raw tokens have been chunked for restore, input latents are on host
+    def restore_kv(self,
+                batch_uids: Iterable[int],
+                batch_tokens: Iterable[torch.Tensor],
+                batch_latents: Iterable[torch.Tensor]) -> torch.Tensor:
+        self._batch.clear()
+        latents_list = []
+        for uid, tokens, latents in zip(batch_uids, batch_tokens, batch_latents):
+            if not latents == None:
+                host_seq_desc = self._state_manager.get_or_create_sequence(uid)
+                self._model.maybe_allocate_kv(host_seq_desc, tokens.numel())
+
+                host_seq_desc.pre_forward(tokens.numel())
+                self._batch.insert_sequence(host_seq_desc, tokens)
+                latents_list.append(latents)
+        if len(latents_list):
+            concatted_latents = torch.concat(latents_list, dim=1)
+            self._batch.finalize()
+            self._model.restore_kv(self._batch, concatted_latents)
+            for uid in batch_uids:
+                host_seq_desc = self._state_manager.get_sequence(uid)
+                host_seq_desc.post_forward()
+
+
     def put(self,
             batch_uids: Iterable[int],
             batch_tokens: Iterable[torch.Tensor],
-            do_checks: bool = True) -> torch.Tensor:
+            do_checks: bool = True) -> Tuple[torch.Tensor, Iterable[torch.Tensor]]:
         """
         Put a ragged batch onto the inference engine. This will perform one forward and return
         a Tensor of the shape [len(batch_uids), *output_shape]. Logits for the non-final tokens
@@ -130,6 +154,7 @@ class InferenceEngineV2:
 
             host_seq_desc = self._state_manager.get_or_create_sequence(uid)
             self._model.maybe_allocate_kv(host_seq_desc, tokens.numel())
+            
             host_seq_desc.pre_forward(tokens.numel())
 
             # We can disable checks since we already validated schedulability.
@@ -137,13 +162,21 @@ class InferenceEngineV2:
 
         # Send all metadata to the device
         self._batch.finalize()
-
+        # print("===========")
+        # print(f"batch: \ninput ids: {self._batch._input_ids_shadow} \nmetadata_storage: {self._batch._batch_metadata_storage_shadow} \ntoken_to_seq: {self._batch.tokens_to_seq}\ninflight_seq_descriptors: {self._batch._batch_metadata_storage_shadow}")
         # Prep all data structures for the actual forward (in anticipation of CG in the future)
         # and also to amortize some of the costs in a more straightforward way.
         self._model.prepare_batch(self._batch)
 
         # Model implementation will pick up in the forward.
-        logits = self._model.forward(self._batch)
+        logits, latents = self._model.forward(self._batch)
+        splitted_latents = []
+        for idx, seq_descriptor in enumerate(self._batch._inflight_seq_descriptors_shadow):
+            if idx >= len(batch_uids):
+                break
+            seq_begin = seq_descriptor[0]
+            seq_len = seq_descriptor[1]
+            splitted_latents.append(latents[:, seq_begin:seq_begin + seq_len])
 
         # We return one set of logits per sequence in the batch (saves cost on unembedding)
         assert logits.shape[0] == self._batch.current_sequences
@@ -153,7 +186,7 @@ class InferenceEngineV2:
             host_seq_desc.post_forward()  # Updates sequence metadata.
             self._model.maybe_free_kv(host_seq_desc)
 
-        return logits
+        return logits, splitted_latents
 
     def query(self, uid: int, max_request_tokens: int, max_request_blocks) -> Tuple[int, torch.Tensor]:
         """

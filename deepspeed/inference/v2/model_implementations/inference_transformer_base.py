@@ -385,6 +385,12 @@ class DSTransformerModelBase(DSInferenceModelBase):
                                                   cache_dtype=self.activation_dtype,
                                                   max_blocks_per_allocation_group=max_blocks)
         return (self._kv_cache_config, )
+    
+    def restore_kv(self, wrapped_batch: RaggedBatchWrapper, latents: torch.Tensor):
+        # for layer_idx, latent in enumerate(latents):
+        #     qkv = self.qkv(latent)
+        raise NotImplementedError("Attempted to access an unimplemented normalization flag")
+        
 
     def prepare_batch(self, wrapped_batch: RaggedBatchWrapper) -> None:
         """

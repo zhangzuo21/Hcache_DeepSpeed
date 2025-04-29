@@ -166,6 +166,13 @@ class DSStateManager:
         # TODO(cmikeh2): Debug call here might be unnecessary and is potentially on critical path.
         logger.debug(f"Created sequence {uid} with tracking slot {tracking_slot}.")
         return self._seqs[uid]
+    
+    def restore_kv(self, uid: int, latent: torch.Tensor, qk_layer, qk_w):
+        for layer_id, latent_layer in enumerate(latent):
+            kv_cache = self.get_cache(layer_id)
+            qk = qk_layer(latent_layer, qk_w, b=None)
+            
+
 
     @property
     def tracked_sequences(self) -> Dict[int, DSSequenceDescriptor]:

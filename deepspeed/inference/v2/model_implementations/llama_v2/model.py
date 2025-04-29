@@ -8,6 +8,7 @@ from typing import Iterable, Optional, Tuple
 import torch
 
 import deepspeed.comm as dist
+from deepspeed.accelerator import get_accelerator
 
 from ...allocator import empty_from
 from ...inference_utils import ActivationType, DtypeEnum
@@ -144,6 +145,8 @@ class Llama2InferenceModel(DSTransformerModelBase):
             ragged_batch_info (RaggedBatchWrapper): The batch metadata.
         """
         # TODO(cmikeh2): Distribute ragged_batch_info to all modules
+        # pinned_hidden_state = torch.empty_like(hidden_states, device='cpu', pin_memory=True)
+        # pinned_hidden_state.copy_(hidden_states, non_blocking=True)
 
         cur_params = self._transformer[layer_idx]
         kv_cache = self.state_manager.get_cache(layer_idx)
@@ -196,14 +199,30 @@ class Llama2InferenceModel(DSTransformerModelBase):
         else:
             return logits
 
-    def forward(self, wrapped_batch: RaggedBatchWrapper) -> torch.Tensor:
+    def forward(self, wrapped_batch: RaggedBatchWrapper) -> Tuple[torch.Tensor, torch.Tensor]:
 
         residual = self._forward_embed(wrapped_batch)
+        # print(f"input ids: {wrapped_batch._input_ids_shadow}")
 
         residual, hidden_states = self.norm(residual, None, self._transformer[0].attn_norm_gamma, beta=None)
+        # print("=============")
+        # print(hidden_states)
+        latent_buffer = torch.empty((self.num_layers, hidden_states.shape[0], hidden_states.shape[1]), device=get_accelerator().current_device(), dtype=hidden_states.dtype)
 
         for layer_idx in range(self.num_layers):
+            latent_buffer[layer_idx].copy_(hidden_states)
             residual, hidden_states = self._forward_transformer_layer(layer_idx, residual, hidden_states,
                                                                       wrapped_batch)
 
-        return self._forward_unembed(residual, wrapped_batch)
+        latent_cpu = latent_buffer.cpu()
+        del latent_buffer
+        return self._forward_unembed(residual, wrapped_batch), latent_cpu
+
+    def restore_kv(self, wrapped_batch: RaggedBatchWrapper, latents: torch.Tensor):
+        # print(f"restore latents:{latents[0]}")
+        for layer_idx, latent in enumerate(latents):
+            latent = latent.to(get_accelerator().current_device())
+            cur_params = self._transformer[layer_idx]
+            qkv = self.qkv(latent, cur_params.qkv_w, b=None)
+            kv_cache = self.state_manager.get_cache(layer_idx)
+            self.attn.restore_kv(qkv, kv_cache, wrapped_batch)
