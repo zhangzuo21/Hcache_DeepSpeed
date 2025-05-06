@@ -90,6 +90,7 @@ class InferenceEngineV2:
                                              self._model.kv_cache_config(),
                                              base_mp_group=self._base_mp_group)
         self._model.set_state_manager(self._state_manager)
+        self._model._forward_time = 0
 
     def _initialize_tp_group(self):
         """
