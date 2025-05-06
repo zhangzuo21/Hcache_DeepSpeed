@@ -17,7 +17,7 @@ from deepspeed.comm.comm import init_distributed
 
 from .model_implementations import InferenceV2Policy
 from .logging import inference_logger
-from .ragged import DSStateManager, RaggedBatchWrapper, PlaceholderSequenceDescriptor
+from .ragged import DSStateManager, RaggedBatchWrapper, RestoreBatch,  PlaceholderSequenceDescriptor
 from .scheduling_utils import SchedulingError, SchedulingResult
 from .model_implementations.flat_model_helpers import make_param_filename, make_metadata_filename
 from .model_implementations.inference_model_base import DSInferenceModelBase
@@ -85,6 +85,7 @@ class InferenceEngineV2:
 
         # Create state manager
         self._batch = RaggedBatchWrapper(self._config.state_manager)
+        self._restore_batch = RestoreBatch(self._config.state_manager)
         self._state_manager = DSStateManager(self._config.state_manager,
                                              self._model.kv_cache_config(),
                                              base_mp_group=self._base_mp_group)
@@ -131,6 +132,9 @@ class InferenceEngineV2:
     def put(self,
             batch_uids: Iterable[int],
             batch_tokens: Iterable[torch.Tensor],
+            restore_uids: Iterable[torch.Tensor],
+            restore_tokens: Iterable[torch.Tensor],
+            restore_latents: Iterable[torch.Tensor],
             do_checks: bool = True) -> Tuple[torch.Tensor, Iterable[torch.Tensor]]:
         """
         Put a ragged batch onto the inference engine. This will perform one forward and return
@@ -150,6 +154,27 @@ class InferenceEngineV2:
                 raise SchedulingError(schedule_check)
 
         self._batch.clear()
+        self._restore_batch.clear()
+
+        self._restore_batch._restore_latents = None
+        if len(restore_uids):
+            latents_list = []
+            for uid, tokens, latents in zip(restore_uids, restore_tokens, restore_latents):
+                if not latents == None:
+                    restore_host_seq_desc = self._state_manager.get_or_create_sequence(uid)
+                    self._model.maybe_allocate_kv(restore_host_seq_desc, tokens.numel())
+
+                    restore_host_seq_desc.pre_forward(tokens.numel())
+                    self._restore_batch.insert_sequence(restore_host_seq_desc, tokens)
+                    latents_list.append(latents)
+            if len(latents_list):
+                concatted_latents = torch.concat(latents_list, dim=1)
+                self._restore_batch._restore_latents = concatted_latents
+                self._restore_batch.finalize()
+                for uid in restore_uids:
+                    restore_host_seq_desc = self._state_manager.get_sequence(uid)
+                    restore_host_seq_desc.post_forward()
+
         for uid, tokens in zip(batch_uids, batch_tokens):
 
             host_seq_desc = self._state_manager.get_or_create_sequence(uid)
@@ -169,7 +194,7 @@ class InferenceEngineV2:
         self._model.prepare_batch(self._batch)
 
         # Model implementation will pick up in the forward.
-        logits, latents = self._model.forward(self._batch)
+        logits, latents = self._model.forward(self._batch, self._restore_batch)
         splitted_latents = []
         for idx, seq_descriptor in enumerate(self._batch._inflight_seq_descriptors_shadow):
             if idx >= len(batch_uids):

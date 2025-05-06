@@ -16,7 +16,7 @@ from ...inference_utils import ActivationType, DtypeEnum
 from .. import *
 from ...modules.configs import *
 from ...modules.interfaces import *
-from ...ragged import RaggedBatchWrapper
+from ...ragged import RaggedBatchWrapper, RestoreBatch
 
 from .container import Llama2NonTransformerContainer, Llama2TransformerContainer
 
@@ -133,7 +133,7 @@ class Llama2InferenceModel(DSTransformerModelBase):
         return embed
 
     def _forward_transformer_layer(self, layer_idx: int, residual: torch.Tensor, hidden_states: torch.Tensor,
-                                   ragged_batch_info: RaggedBatchWrapper) -> Tuple[torch.Tensor, torch.Tensor]:
+                                   ragged_batch_info: RaggedBatchWrapper, restore_batch: RestoreBatch) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Executes one (slightly offset) layer of the transformer. This implementation does a peak-ahead
         optimization to fuse the layer norm of the next layer into the current layer.
@@ -149,13 +149,31 @@ class Llama2InferenceModel(DSTransformerModelBase):
         # pinned_hidden_state = torch.empty_like(hidden_states, device='cpu', pin_memory=True)
         # pinned_hidden_state.copy_(hidden_states, non_blocking=True)
 
+
         cur_params = self._transformer[layer_idx]
         kv_cache = self.state_manager.get_cache(layer_idx)
+        # print("============")
+        if not restore_batch._restore_latents is None:
+            restore_latent = restore_batch._restore_latents[layer_idx].to(get_accelerator().current_device())
+            merged_latent = torch.concat([restore_latent, hidden_states], dim=0)
+            # print(f"conbined: {merged_latent}")
+            restore_len = restore_latent.shape[0]
+            merged_latent = self.qkv(merged_latent, cur_params.qkv_w, b=None)
+            # print(f"merged qkv:{merged_latent}")
+            restore_kv = merged_latent[0:restore_len]
+            hidden_states = merged_latent[restore_len:]
+            self.attn.restore_kv(restore_kv, kv_cache, restore_batch)
+            kv_cache = self.state_manager.get_cache(layer_idx)
+        else:
+            # print(f"hidden_states: {hidden_states}")
+            hidden_states = self.qkv(hidden_states, cur_params.qkv_w, b=None)
 
-        hidden_states = self.qkv(hidden_states, cur_params.qkv_w, b=None)
+        
         hidden_states = self.attn(hidden_states, kv_cache, ragged_batch_info)
+        # if layer_idx == 0:
+        #     print(f"kv cache: {kv_cache[0]}")
         hidden_states = self.attn_out(hidden_states, cur_params.attn_out_w, b=None)
-
+        
         if self.tp_size > 1:
             dist.all_reduce(hidden_states, group=self._base_mp_group)
 
@@ -200,20 +218,18 @@ class Llama2InferenceModel(DSTransformerModelBase):
         else:
             return logits
 
-    def forward(self, wrapped_batch: RaggedBatchWrapper) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, wrapped_batch: RaggedBatchWrapper, restore_batch: RestoreBatch) -> Tuple[torch.Tensor, torch.Tensor]:
+
 
         residual = self._forward_embed(wrapped_batch)
-        # print(f"input ids: {wrapped_batch._input_ids_shadow}")
 
         residual, hidden_states = self.norm(residual, None, self._transformer[0].attn_norm_gamma, beta=None)
-        # print("=============")
-        # print(hidden_states)
         latent_buffer = torch.empty((self.num_layers, hidden_states.shape[0], hidden_states.shape[1]), device=get_accelerator().current_device(), dtype=hidden_states.dtype)
 
         for layer_idx in range(self.num_layers):
             latent_buffer[layer_idx].copy_(hidden_states)
             residual, hidden_states = self._forward_transformer_layer(layer_idx, residual, hidden_states,
-                                                                      wrapped_batch)
+                                                                      wrapped_batch, restore_batch)
 
         latent_cpu = latent_buffer.cpu()
         del latent_buffer

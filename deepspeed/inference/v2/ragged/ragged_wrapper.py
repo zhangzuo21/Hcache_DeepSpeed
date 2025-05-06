@@ -3,7 +3,7 @@
 
 # DeepSpeed Team
 
-from typing import Optional
+from typing import Optional, List
 
 import torch
 
@@ -290,3 +290,6 @@ class RaggedBatchWrapper:
         synchronization with the device.
         """
         return self._current_sequences
+
+class RestoreBatch(RaggedBatchWrapper):
+    _restore_latents: torch.Tensor

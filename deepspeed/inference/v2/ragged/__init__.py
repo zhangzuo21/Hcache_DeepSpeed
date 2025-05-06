@@ -11,5 +11,5 @@ from .manager_configs import (
     MemoryConfig,
 )
 from .ragged_manager import DSStateManager
-from .ragged_wrapper import RaggedBatchWrapper
+from .ragged_wrapper import RaggedBatchWrapper, RestoreBatch
 from .sequence_descriptor import DSSequenceDescriptor, PlaceholderSequenceDescriptor
