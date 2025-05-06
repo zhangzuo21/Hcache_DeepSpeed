@@ -134,7 +134,7 @@ class Llama2InferenceModel(DSTransformerModelBase):
         return embed
 
     def _forward_transformer_layer(self, layer_idx: int, residual: torch.Tensor, hidden_states: torch.Tensor,
-                                   ragged_batch_info: RaggedBatchWrapper, restore_batch: RestoreBatch, io_stream, compute_stream, layer_buffer, io_done_events, temp_store_done_events) -> Tuple[torch.Tensor, torch.Tensor]:
+                                   ragged_batch_info: RaggedBatchWrapper, restore_batch: RestoreBatch, io_stream, compute_stream, layer_buffer, io_done_events) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Executes one (slightly offset) layer of the transformer. This implementation does a peak-ahead
         optimization to fuse the layer norm of the next layer into the current layer.
@@ -156,16 +156,13 @@ class Llama2InferenceModel(DSTransformerModelBase):
         # print("============")
         if not restore_batch._restore_latents is None:
             with torch.cuda.stream(io_stream):
-                if layer_idx > 0:
-                    io_stream.wait_event(temp_store_done_events[layer_idx - 1])
                 restore_latent = restore_batch._restore_latents[layer_idx].to(get_accelerator().current_device())
+                layer_buffer[layer_idx].copy_(restore_latent)
                 io_done_events[layer_idx].record(io_stream)
 
             with torch.cuda.stream(compute_stream):
                 compute_stream.wait_event(io_done_events[layer_idx])
-                layer_buffer.copy_(restore_latent)
-                temp_store_done_events[layer_idx].record(compute_stream)
-                merged_latent = torch.concat([layer_buffer, hidden_states], dim=0)
+                merged_latent = torch.concat([layer_buffer[layer_idx], hidden_states], dim=0)
                 restore_len = restore_latent.shape[0]
                 merged_latent = self.qkv(merged_latent, cur_params.qkv_w, b=None)
             
@@ -232,9 +229,9 @@ class Llama2InferenceModel(DSTransformerModelBase):
         if not restore_batch._restore_latents is None:
             io_stream = Stream()
             compute_stream = torch.cuda.default_stream()
-            layer_buffer = torch.empty_like(restore_batch._restore_latents[0], device=get_accelerator().current_device(), dtype=restore_batch._restore_latents.dtype)
+            layer_buffer = torch.empty_like(restore_batch._restore_latents, device=get_accelerator().current_device(), dtype=restore_batch._restore_latents.dtype)
             io_done_events = [Event() for _ in range(len(restore_batch._restore_latents))]
-            temp_store_done_events = [Event() for _ in range(len(restore_batch._restore_latents))]
+            # temp_store_done_events = [Event() for _ in range(len(restore_batch._restore_latents))]
         else:
             io_stream = None
             compute_stream = None
@@ -250,8 +247,10 @@ class Llama2InferenceModel(DSTransformerModelBase):
             latent_buffer[layer_idx].copy_(hidden_states)
             residual, hidden_states = self._forward_transformer_layer(layer_idx, residual, hidden_states,
                                                                       wrapped_batch, restore_batch, io_stream, compute_stream, layer_buffer,
-                                                                      io_done_events, temp_store_done_events)
-
+                                                                      io_done_events)
+        if not io_stream == None:
+            io_stream.synchronize()
+            compute_stream.synchronize()
         latent_cpu = latent_buffer.cpu()
         del latent_buffer
         self._forward_time += 1
