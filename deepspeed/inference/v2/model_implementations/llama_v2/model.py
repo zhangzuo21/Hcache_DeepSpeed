@@ -4,6 +4,7 @@
 # DeepSpeed Team
 
 from typing import Iterable, Optional, Tuple
+import queue
 
 import torch
 from torch.cuda import Stream, Event
@@ -134,7 +135,7 @@ class Llama2InferenceModel(DSTransformerModelBase):
         return embed
 
     def _forward_transformer_layer(self, layer_idx: int, residual: torch.Tensor, hidden_states: torch.Tensor,
-                                   ragged_batch_info: RaggedBatchWrapper, restore_batch: RestoreBatch, io_stream, compute_stream, layer_buffer, io_done_events) -> Tuple[torch.Tensor, torch.Tensor]:
+                                   ragged_batch_info: RaggedBatchWrapper, restore_batch: RestoreBatch, input_stream, output_stream, compute_stream, layer_buffer, io_done_events, save_queue: queue.Queue, output_ready_events) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Executes one (slightly offset) layer of the transformer. This implementation does a peak-ahead
         optimization to fuse the layer norm of the next layer into the current layer.
@@ -149,16 +150,21 @@ class Llama2InferenceModel(DSTransformerModelBase):
         # TODO(cmikeh2): Distribute ragged_batch_info to all modules
         # pinned_hidden_state = torch.empty_like(hidden_states, device='cpu', pin_memory=True)
         # pinned_hidden_state.copy_(hidden_states, non_blocking=True)
-
+        output_ready_events[layer_idx].record(compute_stream)
+        with torch.cuda.stream(output_stream):
+            output_stream.wait_event(output_ready_events[layer_idx])
+            output_latent_buffer = torch.empty((hidden_states.shape[0], hidden_states.shape[1]), device='cpu', dtype=hidden_states.dtype)
+            output_latent_buffer.copy_(hidden_states)
+            save_queue.put(output_latent_buffer)
 
         cur_params = self._transformer[layer_idx]
         kv_cache = self.state_manager.get_cache(layer_idx)
         # print("============")
         if not restore_batch._restore_latents is None:
-            with torch.cuda.stream(io_stream):
+            with torch.cuda.stream(input_stream):
                 restore_latent = restore_batch._restore_latents[layer_idx].to(get_accelerator().current_device())
                 layer_buffer[layer_idx].copy_(restore_latent)
-                io_done_events[layer_idx].record(io_stream)
+                io_done_events[layer_idx].record(input_stream)
 
             with torch.cuda.stream(compute_stream):
                 compute_stream.wait_event(io_done_events[layer_idx])
@@ -224,37 +230,39 @@ class Llama2InferenceModel(DSTransformerModelBase):
         else:
             return logits
 
-    def forward(self, wrapped_batch: RaggedBatchWrapper, restore_batch: RestoreBatch) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, wrapped_batch: RaggedBatchWrapper, restore_batch: RestoreBatch, save_queue: queue.Queue) -> Tuple[torch.Tensor, torch.Tensor]:
 
+        output_stream = Stream()
+        compute_stream = torch.cuda.default_stream()
+        output_ready_events = [Event() for _ in range(self.num_layers)]
         if not restore_batch._restore_latents is None:
-            io_stream = Stream()
-            compute_stream = torch.cuda.default_stream()
+            input_stream = Stream()
             layer_buffer = torch.empty_like(restore_batch._restore_latents, device=get_accelerator().current_device(), dtype=restore_batch._restore_latents.dtype)
-            io_done_events = [Event() for _ in range(len(restore_batch._restore_latents))]
+            input_done_events = [Event() for _ in range(len(restore_batch._restore_latents))]
             # temp_store_done_events = [Event() for _ in range(len(restore_batch._restore_latents))]
         else:
-            io_stream = None
-            compute_stream = None
+            input_stream = None
             layer_buffer = None
-            io_done_events = []
+            input_done_events = []
             temp_store_done_events = []
         residual = self._forward_embed(wrapped_batch)
 
         residual, hidden_states = self.norm(residual, None, self._transformer[0].attn_norm_gamma, beta=None)
-        latent_buffer = torch.empty((self.num_layers, hidden_states.shape[0], hidden_states.shape[1]), device=get_accelerator().current_device(), dtype=hidden_states.dtype)
+        # latent_buffer = torch.empty((self.num_layers, hidden_states.shape[0], hidden_states.shape[1]), device=get_accelerator().current_device(), dtype=hidden_states.dtype)
 
         for layer_idx in range(self.num_layers):
-            latent_buffer[layer_idx].copy_(hidden_states)
+            # latent_buffer[layer_idx].copy_(hidden_states)
             residual, hidden_states = self._forward_transformer_layer(layer_idx, residual, hidden_states,
-                                                                      wrapped_batch, restore_batch, io_stream, compute_stream, layer_buffer,
-                                                                      io_done_events)
-        if not io_stream == None:
-            io_stream.synchronize()
+                                                                      wrapped_batch, restore_batch, input_stream, output_stream, compute_stream, layer_buffer,
+                                                                      input_done_events, save_queue, output_ready_events)
+        if not input_stream == None:
+            input_stream.synchronize()
+            output_stream.synchronize()
             compute_stream.synchronize()
-        latent_cpu = latent_buffer.cpu()
-        del latent_buffer
+        # latent_cpu = latent_buffer.cpu()
+        # del latent_buffer
         self._forward_time += 1
-        return self._forward_unembed(residual, wrapped_batch), latent_cpu
+        return self._forward_unembed(residual, wrapped_batch)
 
     def restore_kv(self, wrapped_batch: RaggedBatchWrapper, latents: torch.Tensor):
         io_stream = Stream()

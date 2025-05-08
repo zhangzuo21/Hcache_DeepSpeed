@@ -7,6 +7,7 @@ import os
 import json
 import pickle
 from typing import Iterable, Tuple
+import queue
 
 import torch
 
@@ -136,7 +137,8 @@ class InferenceEngineV2:
             restore_uids: Iterable[torch.Tensor],
             restore_tokens: Iterable[torch.Tensor],
             restore_latents: Iterable[torch.Tensor],
-            do_checks: bool = True) -> Tuple[torch.Tensor, Iterable[torch.Tensor]]:
+            save_queue: queue.Queue,
+            do_checks: bool = True) -> torch.Tensor:
         """
         Put a ragged batch onto the inference engine. This will perform one forward and return
         a Tensor of the shape [len(batch_uids), *output_shape]. Logits for the non-final tokens
@@ -193,16 +195,17 @@ class InferenceEngineV2:
         # Prep all data structures for the actual forward (in anticipation of CG in the future)
         # and also to amortize some of the costs in a more straightforward way.
         self._model.prepare_batch(self._batch)
+        save_queue.put(self._batch._inflight_seq_descriptors_shadow)
 
         # Model implementation will pick up in the forward.
-        logits, latents = self._model.forward(self._batch, self._restore_batch)
-        splitted_latents = []
-        for idx, seq_descriptor in enumerate(self._batch._inflight_seq_descriptors_shadow):
-            if idx >= len(batch_uids):
-                break
-            seq_begin = seq_descriptor[0]
-            seq_len = seq_descriptor[1]
-            splitted_latents.append(latents[:, seq_begin:seq_begin + seq_len])
+        logits = self._model.forward(self._batch, self._restore_batch, save_queue)
+        # splitted_latents = []
+        # for idx, seq_descriptor in enumerate(self._batch._inflight_seq_descriptors_shadow):
+        #     if idx >= len(batch_uids):
+        #         break
+        #     seq_begin = seq_descriptor[0]
+        #     seq_len = seq_descriptor[1]
+        #     splitted_latents.append(latents[:, seq_begin:seq_begin + seq_len])
 
         # We return one set of logits per sequence in the batch (saves cost on unembedding)
         assert logits.shape[0] == self._batch.current_sequences
@@ -212,7 +215,7 @@ class InferenceEngineV2:
             host_seq_desc.post_forward()  # Updates sequence metadata.
             self._model.maybe_free_kv(host_seq_desc)
 
-        return logits, splitted_latents
+        return logits
 
     def query(self, uid: int, max_request_tokens: int, max_request_blocks) -> Tuple[int, torch.Tensor]:
         """
