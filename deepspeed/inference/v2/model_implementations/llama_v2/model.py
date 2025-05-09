@@ -153,8 +153,8 @@ class Llama2InferenceModel(DSTransformerModelBase):
         output_ready_events[layer_idx].record(compute_stream)
         with torch.cuda.stream(output_stream):
             output_stream.wait_event(output_ready_events[layer_idx])
-            output_latent_buffer = torch.empty((hidden_states.shape[0], hidden_states.shape[1]), device='cpu', dtype=hidden_states.dtype)
-            output_latent_buffer.copy_(hidden_states)
+            output_latent_buffer = torch.empty((hidden_states.shape[0], hidden_states.shape[1]), device='cpu', dtype=hidden_states.dtype, pin_memory=True)
+            output_latent_buffer.copy_(hidden_states, non_blocking=True)
             save_queue.put(output_latent_buffer)
 
         cur_params = self._transformer[layer_idx]
